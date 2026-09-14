@@ -33,13 +33,13 @@
     },
     "platformConfig": {
         "macos": {
-            "bundleId": "com.delayedsourceengine.plugin"
+            "bundleId": "com.khrizyt.kzdelaydinamico"
         }
     },
-    "name": "delayed-source-engine",
-    "displayName": "Broadcast Delay",
+    "name": "kz-delay-dinamico",
+    "displayName": "KZ Delay Dinámico",
     "version": "1.0.0",
-    "author": "Hakan K.",
-    "website": "https://github.com/H0K0H/obs-broadcast-delay",
+    "author": "KhrizYT",
+    "website": "https://github.com/KhrizYT/KZ-Delay-Dinamico",
     "email": ""
 }
