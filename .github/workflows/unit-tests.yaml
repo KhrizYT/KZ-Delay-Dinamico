@@ -1,0 +1,20 @@
+name: Unit Tests 🧪
+# Standalone unit tests for the pure (OBS-free) engine modules — VideoRing,
+# TimeStretch (WSOLA) and AudioMixer. Builds + runs without libobs/Qt/GPU, so it
+# is fast and platform-independent (one Linux job is enough).
+on:
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  pure-modules:
+    name: Pure modules 🧮
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure ⚙️
+        run: cmake -S tests -B tests/build -DCMAKE_BUILD_TYPE=Release
+      - name: Build 🛠️
+        run: cmake --build tests/build --config Release
+      - name: Run tests ✅
+        run: ctest --test-dir tests/build --output-on-failure

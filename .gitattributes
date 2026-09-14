@@ -1,0 +1,3 @@
+# GitHub Linguist: keep the language stats representative of THIS project (C++).
+# Third-party vendored code (miniaudio, stb) must not skew the language bar.
+src/vendor/** linguist-vendored

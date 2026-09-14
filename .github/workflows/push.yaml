@@ -1,0 +1,27 @@
+name: Build
+run-name: ${{ github.ref_name }} build 🏗️
+on:
+  push:
+    branches:
+      - master
+      - main
+      - 'release/**'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  unit-tests:
+    name: Unit Tests 🧪
+    # Fast, OBS-free tests of the pure engine modules (rings / WSOLA / mixer).
+    uses: ./.github/workflows/unit-tests.yaml
+    permissions:
+      contents: read
+  build-project:
+    name: Build Project 🧱
+    # Builds Windows / macOS / Linux and uploads the installers as workflow
+    # artifacts (Actions run -> Artifacts). No GitHub Release is created — grab
+    # the artifacts and attach them to a release manually.
+    uses: ./.github/workflows/build-project.yaml
+    secrets: inherit
+    permissions:
+      contents: read
