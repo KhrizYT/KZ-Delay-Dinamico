@@ -1,10 +1,10 @@
 /*
  * KZ Delay Dinámico - controlador simple para OBS + Aitum Vertical.
  *
- * V2 crea sus motores de retardo de forma privada. El usuario no necesita
- * crear escenas ni fuentes auxiliares: el plugin conserva las escenas normales
- * de OBS/Aitum como objetivos y conmuta directamente los canvases a los motores
- * retardados cuando se activa el retardo.
+ * V2.2 crea sus motores de retardo de forma privada. El usuario no necesita
+ * crear escenas ni fuentes auxiliares. La salida horizontal usa una escena
+ * privada para conservar intacto el sistema de transiciones de OBS; Aitum
+ * Vertical se conmuta y restaura mediante su propio canvas/API.
  */
 #include "kz-delay-dock.hpp"
 
@@ -48,6 +48,7 @@ std::string g_vertical_canvas_name;
 
 obs_source_t *g_main_delay_source = nullptr;
 obs_source_t *g_vertical_delay_source = nullptr;
+obs_scene_t *g_main_output_scene = nullptr;
 obs_canvas_t *g_vertical_canvas = nullptr;
 
 bool g_delay_output_active = false;
@@ -153,6 +154,15 @@ bool ensure_internal_graph()
 	if (!g_main_delay_source)
 		return false;
 
+	if (!g_main_output_scene) {
+		g_main_output_scene =
+			obs_scene_create_private("__KZDD Salida Horizontal");
+		if (g_main_output_scene)
+			obs_scene_add(g_main_output_scene, g_main_delay_source);
+	}
+	if (!g_main_output_scene)
+		return false;
+
 	if (g_live_vertical_scene.empty())
 		return false;
 
@@ -247,19 +257,7 @@ void set_delay_seconds(int seconds)
 bool setup_ready()
 {
 	return g_main_delay_source && g_vertical_delay_source &&
-	       g_vertical_canvas;
-}
-
-void set_main_canvas_output(obs_source_t *source)
-{
-	if (!source)
-		return;
-
-	obs_canvas_t *canvas = obs_get_main_canvas();
-	if (!canvas)
-		return;
-	obs_canvas_set_channel(canvas, 0, source);
-	obs_canvas_release(canvas);
+	       g_main_output_scene && g_vertical_canvas;
 }
 
 void set_vertical_canvas_output(obs_source_t *source)
@@ -269,34 +267,70 @@ void set_vertical_canvas_output(obs_source_t *source)
 	obs_canvas_set_channel(g_vertical_canvas, 0, source);
 }
 
+bool switch_main_scene_frontend(const std::string &name)
+{
+	if (name.empty())
+		return false;
+
+	obs_source_t *scene = obs_get_source_by_name(name.c_str());
+	if (!scene)
+		return false;
+
+	const bool is_scene = obs_source_is_scene(scene);
+	if (is_scene)
+		obs_frontend_set_current_scene(scene);
+
+	obs_source_release(scene);
+	return is_scene;
+}
+
 void activate_delay_outputs()
 {
 	if (!setup_ready())
 		return;
 
-	set_main_canvas_output(g_main_delay_source);
+	/*
+	 * MUY IMPORTANTE:
+	 * No reemplazamos el canal 0 del canvas principal. En OBS ese canal
+	 * contiene la TRANSICION activa; sustituirla rompe el cambio normal de
+	 * escenas. En su lugar, le pedimos al frontend que transicione a una
+	 * escena PRIVADA que contiene el motor de retardo. La escena no aparece
+	 * en la lista del usuario.
+	 */
+	obs_frontend_set_current_scene(obs_scene_get_source(g_main_output_scene));
+
+	/* Aitum no usa la transición principal de OBS, así que su canvas sí puede
+	 * apuntar temporalmente al motor vertical. Al volver a directo se restaura
+	 * mediante la propia API de Aitum para no dejar su estado desincronizado. */
 	set_vertical_canvas_output(g_vertical_delay_source);
 }
 
 void restore_live_outputs()
 {
-	if (!g_live_main_scene.empty()) {
-		obs_source_t *main =
-			obs_get_source_by_name(g_live_main_scene.c_str());
-		if (main) {
-			set_main_canvas_output(main);
-			obs_source_release(main);
-		}
-	}
+	const std::string main = g_live_main_scene;
+	const std::string vertical = g_live_vertical_scene;
 
-	if (g_vertical_canvas && !g_live_vertical_scene.empty()) {
-		obs_source_t *vertical = obs_canvas_get_source_by_name(
-			g_vertical_canvas, g_live_vertical_scene.c_str());
-		if (vertical) {
-			set_vertical_canvas_output(vertical);
-			obs_source_release(vertical);
+	if (!main.empty())
+		switch_main_scene_frontend(main);
+
+	/* La transición horizontal puede disparar el mapeo normal de Aitum.
+	 * Después forzamos la escena vertical exacta que estaba activa antes
+	 * del retardo, ya usando la API de Aitum. */
+	QTimer::singleShot(120, [vertical] {
+		if (!vertical.empty()) {
+			proc_handler_t *ph = obs_get_proc_handler();
+			if (!ph)
+				return;
+
+			calldata_t cd;
+			calldata_init(&cd);
+			calldata_set_int(&cd, "width", 0);
+			calldata_set_int(&cd, "height", 0);
+			calldata_set_string(&cd, "scene", vertical.c_str());
+			proc_handler_call(ph, "aitum_vertical_switch_scene", &cd);
+			calldata_free(&cd);
 		}
-	}
+	});
 }
 
 void sync_live_targets()
@@ -380,10 +414,10 @@ QString state_text()
 			.arg((int)std::round(st.target_s));
 	if (g_recovering)
 		return QStringLiteral("RECUPERANDO x2 · %1 s detrás")
-			.arg(st.distance_s, 0, 'f', 1);
+			.arg(std::fabs(st.distance_s), 0, 'f', 1);
 	if (g_delay_output_active)
-		return QStringLiteral("RETARDO · %1 s")
-			.arg(st.distance_s, 0, 'f', 1);
+		return QStringLiteral("RETARDO · %1 s detrás")
+			.arg(std::fabs(st.distance_s), 0, 'f', 1);
 	return QStringLiteral("EN DIRECTO · búfer listo (%1 s)")
 		.arg(st.target_s, 0, 'f', 0);
 }
@@ -393,7 +427,8 @@ void poll()
 	sync_live_targets();
 
 	WarpStatus st;
-	if (g_recovering && warp_get_status(st) && st.distance_s <= 0.12)
+	if (g_recovering && warp_get_status(st) &&
+	    std::fabs(st.distance_s) <= 0.12)
 		go_live();
 
 	if (g_state_label)
@@ -489,6 +524,10 @@ void release_internal_graph()
 	if (g_delay_output_active)
 		restore_live_outputs();
 
+	if (g_main_output_scene) {
+		obs_scene_release(g_main_output_scene);
+		g_main_output_scene = nullptr;
+	}
 	if (g_main_delay_source) {
 		obs_source_release(g_main_delay_source);
 		g_main_delay_source = nullptr;
