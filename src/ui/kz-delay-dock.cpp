@@ -37,8 +37,8 @@ namespace {
  * create them automatically and make these names editable. */
 constexpr const char *MAIN_DELAY_SCENE = "Delay Escena";
 constexpr const char *VERT_DELAY_SCENE = "Delay";
-constexpr const char *MAIN_DELAY_SOURCE = "Broadcast Delay";
-constexpr const char *VERT_DELAY_SOURCE = "Broadcast Delay 2";
+constexpr const char *MAIN_DELAY_SOURCE = "KZ Delay Dinámico";
+constexpr const char *VERT_DELAY_SOURCE = "KZ Delay Dinámico 2";
 constexpr const char *DOCK_ID = "KZDelayDock";
 
 QPointer<QWidget> g_dock;
@@ -292,7 +292,7 @@ void recover_x2()
 QString state_text()
 {
 	if (!setup_ready())
-		return QStringLiteral("Falta Broadcast Delay / Broadcast Delay 2 o Delay Escena");
+		return QStringLiteral("Falta KZ Delay Dinámico / KZ Delay Dinámico 2 o Delay Escena");
 
 	WarpStatus st;
 	if (!warp_get_status(st))
@@ -307,9 +307,9 @@ QString state_text()
 		return QStringLiteral("RECUPERANDO x2 · %1 s detrás")
 			.arg(st.distance_s, 0, 'f', 1);
 	if (g_delay_output_active)
-		return QStringLiteral("DELAY · %1 s")
+		return QStringLiteral("RETARDO · %1 s")
 			.arg(st.distance_s, 0, 'f', 1);
-	return QStringLiteral("LIVE · búfer listo (%1 s)")
+	return QStringLiteral("EN DIRECTO · búfer listo (%1 s)")
 		.arg(st.target_s, 0, 'f', 0);
 }
 
@@ -351,7 +351,7 @@ QWidget *build_dock()
 	layout->setContentsMargins(8, 8, 8, 8);
 	layout->setSpacing(8);
 
-	auto *title = new QLabel(QStringLiteral("KZ Delay"));
+	auto *title = new QLabel(QStringLiteral("KZ Delay Dinámico"));
 	QFont tf = title->font();
 	tf.setBold(true);
 	tf.setPointSize(tf.pointSize() + 2);
@@ -368,8 +368,8 @@ QWidget *build_dock()
 	layout->addLayout(delay_row);
 
 	auto *buttons = new QHBoxLayout();
-	g_live_btn = new QPushButton(QStringLiteral("DIRECTO"));
-	g_delay_btn = new QPushButton(QStringLiteral("DELAY"));
+	g_live_btn = new QPushButton(QStringLiteral("EN DIRECTO"));
+	g_delay_btn = new QPushButton(QStringLiteral("ACTIVAR RETARDO"));
 	g_recover_btn = new QPushButton(QStringLiteral("RECUPERAR x2"));
 	buttons->addWidget(g_live_btn);
 	buttons->addWidget(g_delay_btn);
@@ -384,9 +384,9 @@ QWidget *build_dock()
 	layout->addWidget(g_target_label);
 
 	auto *hint = new QLabel(QStringLiteral(
-		"Usa tus escenas normales de OBS. KZ Delay mantiene el búfer horizontal "
+		"Usa tus escenas normales de OBS. KZ Delay Dinámico mantiene el búfer horizontal "
 		"y Aitum Vertical en segundo plano y solo cambia a las escenas Delay cuando "
-		"pulsas DELAY."));
+		"activas el retardo."));
 	hint->setWordWrap(true);
 	hint->setEnabled(false);
 	layout->addWidget(hint);
@@ -413,7 +413,7 @@ void register_kz_delay_dock()
 	g_registered = true;
 
 	g_dock = build_dock();
-	obs_frontend_add_dock_by_id(DOCK_ID, "KZ Delay", g_dock);
+	obs_frontend_add_dock_by_id(DOCK_ID, "KZ Delay Dinámico", g_dock);
 
 	/* The original redirect is useful for the old dock, but harmful to this
 	 * controller because Delay Escena contains the delayed source itself. */

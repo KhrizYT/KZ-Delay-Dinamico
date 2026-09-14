@@ -1,5 +1,5 @@
 /*
- * Broadcast Delay - OBS plugin module entry point
+ * KZ Delay Dinámico - OBS plugin module entry point
  */
 #include <obs-module.h>
 #include <obs-frontend-api.h>
@@ -15,8 +15,8 @@ OBS_MODULE_USE_DEFAULT_LOCALE("kz-delay-dinamico", "es-ES")
 
 MODULE_EXPORT const char *obs_module_description(void)
 {
-	return "Broadcast Delay - time-shifted audio/video broadcast.\n"
-	       "WebSocket API (obs-websocket 30+) vendor broadcast_delay :\n"
+	return "KZ Delay Dinámico - time-shifted audio/video broadcast.\n"
+	       "WebSocket API (obs-websocket 30+) vendor kz_delay_dinamico :\n"
 	       "  set_state, set_redirect, set_dock_scene,\n"
 	       "  seek, seek_step, set_factors, set_seek_step,\n"
 	       "  set_pause_scene, get_status.\n"
