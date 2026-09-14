@@ -1,12 +1,10 @@
 /*
- * KZ Delay - simplified operator dock for Broadcast Delay + Aitum Vertical.
+ * KZ Delay Dinámico - controlador simple para OBS + Aitum Vertical.
  *
- * V1 deliberately reuses the proven delay engine already in this module and
- * replaces the day-to-day workflow with three buttons: LIVE, DELAY, RECOVER.
- * The operator keeps using normal OBS scenes; while live, this controller keeps
- * both the horizontal and Aitum Vertical delay buffers pointed at the current
- * real scenes. Entering delay switches only the program outputs to the existing
- * delay scenes, without retargeting the buffers to themselves.
+ * V2 crea sus motores de retardo de forma privada. El usuario no necesita
+ * crear escenas ni fuentes auxiliares: el plugin conserva las escenas normales
+ * de OBS/Aitum como objetivos y conmuta directamente los canvases a los motores
+ * retardados cuando se activa el retardo.
  */
 #include "kz-delay-dock.hpp"
 
@@ -18,7 +16,6 @@
 #include <callback/proc.h>
 
 #include <QFont>
-#include <QGroupBox>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QPointer>
@@ -33,12 +30,7 @@
 
 namespace {
 
-/* V1 uses the scenes/sources already proven in the user's setup. A later V2 can
- * create them automatically and make these names editable. */
-constexpr const char *MAIN_DELAY_SCENE = "Delay Escena";
-constexpr const char *VERT_DELAY_SCENE = "Delay";
-constexpr const char *MAIN_DELAY_SOURCE = "KZ Delay Dinámico";
-constexpr const char *VERT_DELAY_SOURCE = "KZ Delay Dinámico 2";
+constexpr const char *DELAY_SOURCE_ID = "kz_delay_dinamico";
 constexpr const char *DOCK_ID = "KZDelayDinamicoDock";
 
 QPointer<QWidget> g_dock;
@@ -53,9 +45,19 @@ QPointer<QTimer> g_timer;
 std::string g_live_main_scene;
 std::string g_live_vertical_scene;
 std::string g_vertical_canvas_name;
+
+obs_source_t *g_main_delay_source = nullptr;
+obs_source_t *g_vertical_delay_source = nullptr;
+obs_canvas_t *g_vertical_canvas = nullptr;
+
 bool g_delay_output_active = false;
 bool g_recovering = false;
 bool g_registered = false;
+
+int current_delay_seconds()
+{
+	return g_delay_spin ? g_delay_spin->value() : 30;
+}
 
 std::string current_main_scene()
 {
@@ -66,20 +68,6 @@ std::string current_main_scene()
 	std::string out = name ? name : "";
 	obs_source_release(cur);
 	return out;
-}
-
-bool switch_main_scene(const std::string &name)
-{
-	if (name.empty())
-		return false;
-	obs_source_t *scene = obs_get_source_by_name(name.c_str());
-	if (!scene)
-		return false;
-	const bool is_scene = obs_source_is_scene(scene);
-	if (is_scene)
-		obs_frontend_set_current_scene(scene);
-	obs_source_release(scene);
-	return is_scene;
 }
 
 std::string aitum_current_scene()
@@ -99,125 +87,216 @@ std::string aitum_current_scene()
 	return out;
 }
 
-bool aitum_switch_scene(const std::string &scene)
-{
-	if (scene.empty())
-		return false;
-	proc_handler_t *ph = obs_get_proc_handler();
-	if (!ph)
-		return false;
-
-	calldata_t cd;
-	calldata_init(&cd);
-	calldata_set_int(&cd, "width", 0);
-	calldata_set_int(&cd, "height", 0);
-	calldata_set_string(&cd, "scene", scene.c_str());
-	const bool ok = proc_handler_call(ph, "aitum_vertical_switch_scene", &cd);
-	calldata_free(&cd);
-	return ok;
-}
-
-struct CanvasLookup {
+struct CanvasRefLookup {
 	std::string scene_name;
 	std::string canvas_name;
+	obs_canvas_t *canvas = nullptr;
 };
 
-bool find_canvas_for_scene(void *param, obs_canvas_t *canvas)
+bool find_canvas_ref_for_scene(void *param, obs_canvas_t *canvas)
 {
-	auto *lookup = static_cast<CanvasLookup *>(param);
+	auto *lookup = static_cast<CanvasRefLookup *>(param);
 	obs_source_t *src =
 		obs_canvas_get_source_by_name(canvas, lookup->scene_name.c_str());
 	if (!src)
 		return true;
+
 	obs_source_release(src);
+	lookup->canvas = obs_canvas_get_ref(canvas);
 	const char *name = obs_canvas_get_name(canvas);
 	lookup->canvas_name = name ? name : "";
 	return false;
 }
 
-std::string canvas_for_scene(const std::string &scene)
+bool refresh_vertical_canvas(const std::string &scene)
 {
 	if (scene.empty())
-		return {};
-	CanvasLookup lookup{scene, {}};
-	obs_enum_canvases(find_canvas_for_scene, &lookup);
-	return lookup.canvas_name;
-}
-
-bool source_exists(const char *name)
-{
-	obs_source_t *src = obs_get_source_by_name(name);
-	if (!src)
 		return false;
-	obs_source_release(src);
+
+	CanvasRefLookup lookup{scene, {}, nullptr};
+	obs_enum_canvases(find_canvas_ref_for_scene, &lookup);
+	if (!lookup.canvas)
+		return false;
+
+	if (g_vertical_canvas)
+		obs_canvas_release(g_vertical_canvas);
+	g_vertical_canvas = lookup.canvas;
+	g_vertical_canvas_name = lookup.canvas_name;
 	return true;
 }
 
-void set_source_delay(const char *name, int seconds)
+obs_source_t *create_delay_source(const char *name, int mode, int seconds)
 {
-	obs_source_t *src = obs_get_source_by_name(name);
+	obs_data_t *settings = obs_data_create();
+	obs_data_set_bool(settings, "enabled", true);
+	obs_data_set_int(settings, "mode", mode);
+	obs_data_set_double(settings, "delay_sec", (double)seconds);
+	obs_data_set_int(settings, "storage", STORAGE_DISK);
+	obs_data_set_int(settings, "audio_storage", 1);
+	obs_data_set_bool(settings, "audio_auto", false);
+
+	obs_source_t *src =
+		obs_source_create_private(DELAY_SOURCE_ID, name, settings);
+	obs_data_release(settings);
+	return src;
+}
+
+bool ensure_internal_graph()
+{
+	const int seconds = current_delay_seconds();
+
+	if (!g_main_delay_source) {
+		g_main_delay_source =
+			create_delay_source("__KZDD Motor Horizontal",
+					    MODE_DOCKS, seconds);
+	}
+	if (!g_main_delay_source)
+		return false;
+
+	if (g_live_vertical_scene.empty())
+		return false;
+
+	if (!g_vertical_canvas ||
+	    g_vertical_canvas_name.empty()) {
+		if (!refresh_vertical_canvas(g_live_vertical_scene))
+			return false;
+	} else {
+		/* Si Aitum cambia de canvas, vuelve a localizarlo automáticamente. */
+		obs_source_t *probe = obs_canvas_get_source_by_name(
+			g_vertical_canvas, g_live_vertical_scene.c_str());
+		if (!probe) {
+			if (!refresh_vertical_canvas(g_live_vertical_scene))
+				return false;
+		} else {
+			obs_source_release(probe);
+		}
+	}
+
+	if (!g_vertical_delay_source) {
+		g_vertical_delay_source =
+			create_delay_source("__KZDD Motor Vertical",
+					    MODE_CANVAS_SCENE, seconds);
+		if (g_vertical_delay_source)
+			obs_source_set_muted(g_vertical_delay_source, true);
+	}
+	if (!g_vertical_delay_source)
+		return false;
+
+	return true;
+}
+
+void set_source_delay(obs_source_t *src, int seconds)
+{
 	if (!src)
 		return;
+
 	obs_data_t *settings = obs_source_get_settings(src);
 	obs_data_set_double(settings, "delay_sec", (double)seconds);
-	/* Long delay on 1440p should stay on disk. Preserve every audio setting. */
 	obs_data_set_int(settings, "storage", STORAGE_DISK);
 	obs_source_update(src, settings);
 	obs_data_release(settings);
-	obs_source_release(src);
 }
 
 void configure_main_source(int seconds)
 {
-	obs_source_t *src = obs_get_source_by_name(MAIN_DELAY_SOURCE);
-	if (!src)
+	if (!g_main_delay_source)
 		return;
-	obs_data_t *settings = obs_source_get_settings(src);
+
+	obs_data_t *settings = obs_source_get_settings(g_main_delay_source);
 	obs_data_set_int(settings, "mode", MODE_DOCKS);
 	obs_data_set_double(settings, "delay_sec", (double)seconds);
 	obs_data_set_int(settings, "storage", STORAGE_DISK);
-	obs_source_update(src, settings);
+	obs_source_update(g_main_delay_source, settings);
 	obs_data_release(settings);
-	obs_source_release(src);
 }
 
 void configure_vertical_source(const std::string &scene, int seconds)
 {
-	if (scene.empty())
+	if (scene.empty() || !g_vertical_delay_source)
 		return;
-	const std::string canvas = canvas_for_scene(scene);
-	if (canvas.empty())
-		return;
-	g_vertical_canvas_name = canvas;
 
-	obs_source_t *src = obs_get_source_by_name(VERT_DELAY_SOURCE);
-	if (!src)
+	if (!refresh_vertical_canvas(scene))
 		return;
-	const std::string target = "@canvas:" + canvas + "|" + scene;
-	obs_data_t *settings = obs_source_get_settings(src);
+
+	const std::string target =
+		"@canvas:" + g_vertical_canvas_name + "|" + scene;
+
+	obs_data_t *settings = obs_source_get_settings(g_vertical_delay_source);
 	obs_data_set_int(settings, "mode", MODE_CANVAS_SCENE);
 	obs_data_set_string(settings, "target", target.c_str());
 	obs_data_set_double(settings, "delay_sec", (double)seconds);
 	obs_data_set_int(settings, "storage", STORAGE_DISK);
-	obs_source_update(src, settings);
+	obs_source_update(g_vertical_delay_source, settings);
 	obs_data_release(settings);
-	/* Never let the vertical companion duplicate audio into the main mix. */
-	obs_source_set_muted(src, true);
-	obs_source_release(src);
+
+	/* El audio sale únicamente por el motor horizontal. */
+	obs_source_set_muted(g_vertical_delay_source, true);
 }
 
 void set_delay_seconds(int seconds)
 {
+	if (!ensure_internal_graph())
+		return;
+
 	configure_main_source(seconds);
-	set_source_delay(VERT_DELAY_SOURCE, seconds);
+	set_source_delay(g_vertical_delay_source, seconds);
 	if (!g_live_vertical_scene.empty())
 		configure_vertical_source(g_live_vertical_scene, seconds);
 }
 
 bool setup_ready()
 {
-	return source_exists(MAIN_DELAY_SOURCE) && source_exists(VERT_DELAY_SOURCE) &&
-	       source_exists(MAIN_DELAY_SCENE);
+	return g_main_delay_source && g_vertical_delay_source &&
+	       g_vertical_canvas;
+}
+
+void set_main_canvas_output(obs_source_t *source)
+{
+	if (!source)
+		return;
+
+	obs_canvas_t *canvas = obs_get_main_canvas();
+	if (!canvas)
+		return;
+	obs_canvas_set_channel(canvas, 0, source);
+	obs_canvas_release(canvas);
+}
+
+void set_vertical_canvas_output(obs_source_t *source)
+{
+	if (!source || !g_vertical_canvas)
+		return;
+	obs_canvas_set_channel(g_vertical_canvas, 0, source);
+}
+
+void activate_delay_outputs()
+{
+	if (!setup_ready())
+		return;
+
+	set_main_canvas_output(g_main_delay_source);
+	set_vertical_canvas_output(g_vertical_delay_source);
+}
+
+void restore_live_outputs()
+{
+	if (!g_live_main_scene.empty()) {
+		obs_source_t *main =
+			obs_get_source_by_name(g_live_main_scene.c_str());
+		if (main) {
+			set_main_canvas_output(main);
+			obs_source_release(main);
+		}
+	}
+
+	if (g_vertical_canvas && !g_live_vertical_scene.empty()) {
+		obs_source_t *vertical = obs_canvas_get_source_by_name(
+			g_vertical_canvas, g_live_vertical_scene.c_str());
+		if (vertical) {
+			set_vertical_canvas_output(vertical);
+			obs_source_release(vertical);
+		}
+	}
 }
 
 void sync_live_targets()
@@ -226,49 +305,43 @@ void sync_live_targets()
 		return;
 
 	const std::string main = current_main_scene();
-	if (!main.empty() && main != MAIN_DELAY_SCENE && main != g_live_main_scene) {
+	if (!main.empty())
 		g_live_main_scene = main;
-		/* KZ owns target routing. Disable the original auto-redirect because it
-		 * would retarget to Delay Escena and create a self-capture loop. */
-		warp_set_redirect_scene(false);
-		warp_set_dock_scene(g_live_main_scene.c_str());
-		configure_main_source(g_delay_spin ? g_delay_spin->value() : 30);
-	}
 
 	const std::string vertical = aitum_current_scene();
-	if (!vertical.empty() && vertical != VERT_DELAY_SCENE &&
-	    vertical != g_live_vertical_scene) {
+	if (!vertical.empty())
 		g_live_vertical_scene = vertical;
+
+	if (!ensure_internal_graph())
+		return;
+
+	warp_set_redirect_scene(false);
+	if (!g_live_main_scene.empty())
+		warp_set_dock_scene(g_live_main_scene.c_str());
+
+	configure_main_source(current_delay_seconds());
+	if (!g_live_vertical_scene.empty())
 		configure_vertical_source(g_live_vertical_scene,
-					  g_delay_spin ? g_delay_spin->value() : 30);
-	}
+					  current_delay_seconds());
 }
 
 void go_live()
 {
 	g_recovering = false;
+	restore_live_outputs();
 	warp_set_state(WARP_LIVE);
 	g_delay_output_active = false;
-
-	if (!g_live_main_scene.empty())
-		switch_main_scene(g_live_main_scene);
-	/* Let Aitum process the native OBS scene change first, then force the exact
-	 * vertical scene we remembered. */
-	const std::string vertical = g_live_vertical_scene;
-	QTimer::singleShot(120, [vertical] {
-		if (!vertical.empty())
-			aitum_switch_scene(vertical);
-	});
 }
 
 void go_delay()
 {
-	/* Capture the current real scenes one last time before switching outputs. */
+	/* Captura los objetivos reales inmediatamente antes de cambiar la salida. */
 	sync_live_targets();
-	if (g_live_main_scene.empty() || g_live_vertical_scene.empty())
+	if (g_live_main_scene.empty() || g_live_vertical_scene.empty() ||
+	    !setup_ready())
 		return;
 
-	const int seconds = g_delay_spin ? g_delay_spin->value() : 30;
+	const int seconds = current_delay_seconds();
 	set_delay_seconds(seconds);
 	warp_set_redirect_scene(false);
 	warp_set_dock_scene(g_live_main_scene.c_str());
@@ -277,8 +350,7 @@ void go_delay()
 
 	g_delay_output_active = true;
 	g_recovering = false;
-	switch_main_scene(MAIN_DELAY_SCENE);
-	QTimer::singleShot(80, [] { aitum_switch_scene(VERT_DELAY_SCENE); });
+	activate_delay_outputs();
 }
 
 void recover_x2()
@@ -291,8 +363,11 @@ void recover_x2()
 
 QString state_text()
 {
+	if (g_live_vertical_scene.empty())
+		return QStringLiteral("Aitum Vertical no detectado todavía");
+
 	if (!setup_ready())
-		return QStringLiteral("Falta KZ Delay Dinámico / KZ Delay Dinámico 2 o Delay Escena");
+		return QStringLiteral("Preparando motores internos...");
 
 	WarpStatus st;
 	if (!warp_get_status(st))
@@ -315,8 +390,6 @@ QString state_text()
 
 void poll()
 {
-	/* While live, OBS + Aitum stay completely native. We only mirror their
-	 * current scene choices into the two background delay buffers. */
 	sync_live_targets();
 
 	WarpStatus st;
@@ -325,6 +398,7 @@ void poll()
 
 	if (g_state_label)
 		g_state_label->setText(state_text());
+
 	if (g_target_label) {
 		const QString h = QString::fromUtf8(g_live_main_scene.c_str());
 		const QString v = QString::fromUtf8(g_live_vertical_scene.c_str());
@@ -338,8 +412,9 @@ void poll()
 	if (g_live_btn)
 		g_live_btn->setEnabled(ready);
 	if (g_delay_btn)
-		g_delay_btn->setEnabled(ready && !g_live_main_scene.empty() &&
-					     !g_live_vertical_scene.empty());
+		g_delay_btn->setEnabled(ready &&
+					!g_live_main_scene.empty() &&
+					!g_live_vertical_scene.empty());
 	if (g_recover_btn)
 		g_recover_btn->setEnabled(ready && g_delay_output_active);
 }
@@ -379,29 +454,54 @@ QWidget *build_dock()
 	g_state_label = new QLabel(QStringLiteral("Preparando..."));
 	g_state_label->setWordWrap(true);
 	layout->addWidget(g_state_label);
+
 	g_target_label = new QLabel();
 	g_target_label->setWordWrap(true);
 	layout->addWidget(g_target_label);
 
 	auto *hint = new QLabel(QStringLiteral(
-		"Usa tus escenas normales de OBS. KZ Delay Dinámico mantiene el búfer horizontal "
-		"y Aitum Vertical en segundo plano y solo cambia a las escenas Delay cuando "
-		"activas el retardo."));
+		"No necesitas crear escenas ni fuentes de retardo. KZ Delay Dinámico "
+		"prepara sus motores internamente y mantiene sincronizados el canvas "
+		"horizontal y Aitum Vertical."));
 	hint->setWordWrap(true);
 	hint->setEnabled(false);
 	layout->addWidget(hint);
 	layout->addStretch(1);
 
-	QObject::connect(g_live_btn, &QPushButton::clicked, [] { go_live(); });
-	QObject::connect(g_delay_btn, &QPushButton::clicked, [] { go_delay(); });
-	QObject::connect(g_recover_btn, &QPushButton::clicked, [] { recover_x2(); });
+	QObject::connect(g_live_btn, &QPushButton::clicked,
+			 [] { go_live(); });
+	QObject::connect(g_delay_btn, &QPushButton::clicked,
+			 [] { go_delay(); });
+	QObject::connect(g_recover_btn, &QPushButton::clicked,
+			 [] { recover_x2(); });
 	QObject::connect(g_delay_spin,
-			 QOverload<int>::of(&QSpinBox::valueChanged), [](int value) {
+			 QOverload<int>::of(&QSpinBox::valueChanged),
+			 [](int value) {
 				 if (!g_delay_output_active)
 					 set_delay_seconds(value);
 			 });
 
 	return root;
+}
+
+void release_internal_graph()
+{
+	if (g_delay_output_active)
+		restore_live_outputs();
+
+	if (g_main_delay_source) {
+		obs_source_release(g_main_delay_source);
+		g_main_delay_source = nullptr;
+	}
+	if (g_vertical_delay_source) {
+		obs_source_release(g_vertical_delay_source);
+		g_vertical_delay_source = nullptr;
+	}
+	if (g_vertical_canvas) {
+		obs_canvas_release(g_vertical_canvas);
+		g_vertical_canvas = nullptr;
+	}
+	g_vertical_canvas_name.clear();
 }
 
 } // namespace
@@ -413,18 +513,18 @@ void register_kz_delay_dock()
 	g_registered = true;
 
 	g_dock = build_dock();
-	obs_frontend_add_dock_by_id(DOCK_ID, "KZ Delay Dinámico", g_dock);
+	obs_frontend_add_dock_by_id(
+		DOCK_ID, "KZ Delay Dinámico", g_dock);
 
-	/* The original redirect is useful for the old dock, but harmful to this
-	 * controller because Delay Escena contains the delayed source itself. */
 	warp_set_redirect_scene(false);
 
 	g_timer = new QTimer(g_dock);
 	QObject::connect(g_timer, &QTimer::timeout, [] { poll(); });
 	g_timer->start(250);
+
 	QTimer::singleShot(800, [] {
 		sync_live_targets();
-		set_delay_seconds(g_delay_spin ? g_delay_spin->value() : 30);
+		set_delay_seconds(current_delay_seconds());
 		poll();
 	});
 }
@@ -433,9 +533,13 @@ void unregister_kz_delay_dock()
 {
 	g_registered = false;
 	g_recovering = false;
-	g_delay_output_active = false;
+
 	if (g_timer)
 		g_timer->stop();
+
+	release_internal_graph();
+	g_delay_output_active = false;
+
 	g_timer = nullptr;
 	g_dock = nullptr;
 	g_state_label = nullptr;
