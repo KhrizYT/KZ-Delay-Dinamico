@@ -39,7 +39,7 @@ constexpr const char *MAIN_DELAY_SCENE = "Delay Escena";
 constexpr const char *VERT_DELAY_SCENE = "Delay";
 constexpr const char *MAIN_DELAY_SOURCE = "KZ Delay Dinámico";
 constexpr const char *VERT_DELAY_SOURCE = "KZ Delay Dinámico 2";
-constexpr const char *DOCK_ID = "KZDelayDock";
+constexpr const char *DOCK_ID = "KZDelayDinamicoDock";
 
 QPointer<QWidget> g_dock;
 QPointer<QLabel> g_state_label;

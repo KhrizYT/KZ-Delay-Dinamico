@@ -90,7 +90,7 @@ namespace {
 
 static const char *dse_get_name(void *)
 {
-	return obs_module_text("DelayedSourceEngine");
+	return "KZ Delay Dinámico";
 }
 
 /* auto_ram_budget() + safe_ram_limit() are in capture/dse-buffers.cpp. */
