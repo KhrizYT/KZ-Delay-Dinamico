@@ -1,10 +1,10 @@
 /*
  * KZ Delay Dinámico - controlador simple para OBS + Aitum Vertical.
  *
- * V2.3 añade enrutamiento automático de audio. El motor horizontal captura
- * las fuentes de audio de OBS, conserva sus asignaciones de pistas y, mientras
- * el retardo está activo, evita que el audio directo salga duplicado. Al volver
- * a directo se restauran exactamente las pistas originales.
+ * V2.4 mejora la fidelidad del audio automático. El motor horizontal captura
+ * únicamente las fuentes que realmente estaban asignadas a alguna pista de OBS
+ * antes del retardo, evitando mezclar fuentes ocultas/no asignadas. También
+ * conserva la máscara real de pistas usadas en lugar de enviar KZ a todas.
  */
 #include "kz-delay-dock.hpp"
 
@@ -216,12 +216,26 @@ void configure_automatic_audio_selection(obs_data_t *settings)
 
 	auto sources = collect_obs_audio_sources();
 	for (obs_source_t *source : sources) {
+		const char *name = obs_source_get_name(source);
+		if (!name || !*name)
+			continue;
+
+		/* Limpia selecciones viejas primero: obs_source_get_settings() conserva
+		 * las claves anteriores entre actualizaciones del motor privado. */
+		obs_data_set_bool(settings, name, false);
+
 		/* Nunca realimentar KZ ni el Broadcast Delay antiguo dentro de KZ. */
 		if (is_kz_delay_source(source) || is_legacy_delay_source(source))
 			continue;
-		const char *name = obs_source_get_name(source);
-		if (name && *name)
-			obs_data_set_bool(settings, name, true);
+
+		/* Solo capturar lo que OBS realmente estaba enviando a alguna pista.
+		 * La V2.3 seleccionaba TODAS las fuentes con audio, incluso ocultas o
+		 * no asignadas, y eso podía cambiar mucho el timbre/mezcla respecto
+		 * del audio nativo de OBS. */
+		if (obs_source_get_audio_mixers(source) == 0)
+			continue;
+
+		obs_data_set_bool(settings, name, true);
 	}
 	release_audio_source_list(sources);
 }
@@ -247,6 +261,8 @@ void silence_direct_audio()
 	restore_direct_audio();
 
 	auto sources = collect_obs_audio_sources();
+	uint32_t kz_mixers = 0;
+
 	for (obs_source_t *source : sources) {
 		/* El propio motor KZ tiene que seguir saliendo. El Broadcast Delay
 		 * antiguo sí se silencia temporalmente para que no duplique audio. */
@@ -256,6 +272,11 @@ void silence_direct_audio()
 		const uint32_t mixers = obs_source_get_audio_mixers(source);
 		if (mixers == 0)
 			continue;
+
+		/* Recuerda qué pistas estaban realmente en uso. No mandaremos KZ a
+		 * pistas que antes no contenían ninguna de estas fuentes. */
+		if (!is_legacy_delay_source(source))
+			kz_mixers |= mixers;
 
 		SavedAudioRoute route;
 		route.source = obs_source_get_ref(source);
@@ -272,9 +293,11 @@ void silence_direct_audio()
 	}
 	release_audio_source_list(sources);
 
-	/* El motor horizontal será la única mezcla enviada durante el retardo. */
+	/* Enviar la mezcla KZ solo a las pistas que realmente usaba el audio
+	 * original. Track 1 como fallback únicamente si no encontramos ninguna. */
 	if (g_main_delay_source)
-		obs_source_set_audio_mixers(g_main_delay_source, 0x3F);
+		obs_source_set_audio_mixers(g_main_delay_source,
+					    kz_mixers ? kz_mixers : 0x01);
 
 	g_audio_direct_silenced = true;
 }
