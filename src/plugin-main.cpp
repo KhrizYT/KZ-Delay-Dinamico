@@ -11,7 +11,7 @@
 #endif
 
 OBS_DECLARE_MODULE()
-OBS_MODULE_USE_DEFAULT_LOCALE("delayed-source-engine", "en-US")
+OBS_MODULE_USE_DEFAULT_LOCALE("kz-delay-dinamico", "es-ES")
 
 MODULE_EXPORT const char *obs_module_description(void)
 {
@@ -25,7 +25,7 @@ MODULE_EXPORT const char *obs_module_description(void)
 
 MODULE_EXPORT const char *obs_module_name(void)
 {
-	return "Broadcast Delay";
+	return "KZ Delay Dinámico";
 }
 
 void register_delayed_source(void);
@@ -111,7 +111,7 @@ static bool load_websocket_api()
 /*  Request callbacks                                                   */
 /* ------------------------------------------------------------------ */
 
-static const char *VENDOR = "broadcast_delay";
+static const char *VENDOR = "kz_delay_dinamico";
 
 /* set_state  { "state": "live"|"delayed"|"pause"|"play" } */
 static void req_set_state(void *req, void *, void *)
@@ -241,7 +241,7 @@ bool obs_module_load(void)
 	register_kz_delay_dock();
 	obs_frontend_add_event_callback(on_obs_event, nullptr);
 	register_ws_requests();
-	blog(LOG_INFO, "[broadcast-delay] loaded (version %s)", PLUGIN_VERSION);
+	blog(LOG_INFO, "[kz-delay-dinamico] loaded (version %s)", PLUGIN_VERSION);
 	return true;
 }
 
@@ -251,5 +251,5 @@ void obs_module_unload(void)
 	obs_frontend_remove_event_callback(on_obs_event, nullptr);
 	unregister_kz_delay_dock();
 	warp_shutdown();
-	blog(LOG_INFO, "[broadcast-delay] unloaded");
+	blog(LOG_INFO, "[kz-delay-dinamico] unloaded");
 }

@@ -143,7 +143,7 @@ static void dse_update(void *data, obs_data_t *settings)
 	const uint64_t safe = safe_ram_limit();
 	if (budget > safe) {
 		blog(LOG_WARNING,
-		     "[broadcast-delay] RAM budget %.1f GB clamped to %.1f GB to avoid OOM",
+		     "[kz-delay-dinamico] RAM budget %.1f GB clamped to %.1f GB to avoid OOM",
 		     (double)budget / GB, (double)safe / GB);
 		budget = safe;
 	}
@@ -364,7 +364,7 @@ void warp_set_countdown_overlay(bool on)
 void register_delayed_source()
 {
 	struct obs_source_info info = {};
-	info.id = "delayed_source_engine";
+	info.id = "kz_delay_dinamico";
 	info.type = OBS_SOURCE_TYPE_INPUT;
 	info.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_AUDIO |
 			    OBS_SOURCE_CUSTOM_DRAW;
