@@ -1,10 +1,10 @@
 /*
  * KZ Delay Dinámico - controlador simple para OBS + Aitum Vertical.
  *
- * V2.2 crea sus motores de retardo de forma privada. El usuario no necesita
- * crear escenas ni fuentes auxiliares. La salida horizontal usa una escena
- * privada para conservar intacto el sistema de transiciones de OBS; Aitum
- * Vertical se conmuta y restaura mediante su propio canvas/API.
+ * V2.3 añade enrutamiento automático de audio. El motor horizontal captura
+ * las fuentes de audio de OBS, conserva sus asignaciones de pistas y, mientras
+ * el retardo está activo, evita que el audio directo salga duplicado. Al volver
+ * a directo se restauran exactamente las pistas originales.
  */
 #include "kz-delay-dock.hpp"
 
@@ -26,7 +26,9 @@
 #include <QWidget>
 
 #include <cmath>
+#include <cstring>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -54,6 +56,14 @@ obs_canvas_t *g_vertical_canvas = nullptr;
 bool g_delay_output_active = false;
 bool g_recovering = false;
 bool g_registered = false;
+
+struct SavedAudioRoute {
+	obs_source_t *source = nullptr;
+	uint32_t mixers = 0;
+};
+
+std::vector<SavedAudioRoute> g_saved_audio_routes;
+bool g_audio_direct_silenced = false;
 
 int current_delay_seconds()
 {
@@ -126,6 +136,149 @@ bool refresh_vertical_canvas(const std::string &scene)
 	return true;
 }
 
+bool is_kz_delay_source(obs_source_t *source)
+{
+	if (!source)
+		return false;
+	const char *id = obs_source_get_unversioned_id(source);
+	return id && std::strcmp(id, DELAY_SOURCE_ID) == 0;
+}
+
+bool is_legacy_delay_source(obs_source_t *source)
+{
+	if (!source)
+		return false;
+	const char *id = obs_source_get_unversioned_id(source);
+	return id && std::strcmp(id, "delayed_source_engine") == 0;
+}
+
+void add_audio_source_unique(std::vector<obs_source_t *> &out,
+			     obs_source_t *source, bool already_refed)
+{
+	if (!source)
+		return;
+	if (!(obs_source_get_output_flags(source) & OBS_SOURCE_AUDIO)) {
+		if (already_refed)
+			obs_source_release(source);
+		return;
+	}
+	for (obs_source_t *existing : out) {
+		if (existing == source) {
+			if (already_refed)
+				obs_source_release(source);
+			return;
+		}
+	}
+	if (!already_refed)
+		source = obs_source_get_ref(source);
+	if (source)
+		out.push_back(source);
+}
+
+std::vector<obs_source_t *> collect_obs_audio_sources()
+{
+	std::vector<obs_source_t *> out;
+
+	obs_enum_sources(
+		[](void *param, obs_source_t *source) {
+			auto *list =
+				static_cast<std::vector<obs_source_t *> *>(param);
+			add_audio_source_unique(*list, source, false);
+			return true;
+		},
+		&out);
+
+	/* Desktop Audio / Mic-Aux globales pueden vivir en canales de salida
+	 * aunque no aparezcan como items de una escena. */
+	for (uint32_t ch = 1; ch <= 8; ch++) {
+		obs_source_t *source = obs_get_output_source(ch); /* strong ref */
+		if (source)
+			add_audio_source_unique(out, source, true);
+	}
+
+	return out;
+}
+
+void release_audio_source_list(std::vector<obs_source_t *> &sources)
+{
+	for (obs_source_t *source : sources)
+		obs_source_release(source);
+	sources.clear();
+}
+
+void configure_automatic_audio_selection(obs_data_t *settings)
+{
+	if (!settings)
+		return;
+
+	obs_data_set_bool(settings, "audio_auto", true);
+	obs_data_set_int(settings, "audio_storage", 1);
+
+	auto sources = collect_obs_audio_sources();
+	for (obs_source_t *source : sources) {
+		/* Nunca realimentar KZ ni el Broadcast Delay antiguo dentro de KZ. */
+		if (is_kz_delay_source(source) || is_legacy_delay_source(source))
+			continue;
+		const char *name = obs_source_get_name(source);
+		if (name && *name)
+			obs_data_set_bool(settings, name, true);
+	}
+	release_audio_source_list(sources);
+}
+
+void restore_direct_audio()
+{
+	if (!g_audio_direct_silenced && g_saved_audio_routes.empty())
+		return;
+
+	for (SavedAudioRoute &route : g_saved_audio_routes) {
+		if (route.source) {
+			obs_source_set_audio_mixers(route.source, route.mixers);
+			obs_source_release(route.source);
+			route.source = nullptr;
+		}
+	}
+	g_saved_audio_routes.clear();
+	g_audio_direct_silenced = false;
+}
+
+void silence_direct_audio()
+{
+	restore_direct_audio();
+
+	auto sources = collect_obs_audio_sources();
+	for (obs_source_t *source : sources) {
+		/* El propio motor KZ tiene que seguir saliendo. El Broadcast Delay
+		 * antiguo sí se silencia temporalmente para que no duplique audio. */
+		if (is_kz_delay_source(source))
+			continue;
+
+		const uint32_t mixers = obs_source_get_audio_mixers(source);
+		if (mixers == 0)
+			continue;
+
+		SavedAudioRoute route;
+		route.source = obs_source_get_ref(source);
+		route.mixers = mixers;
+		if (route.source)
+			g_saved_audio_routes.push_back(route);
+
+		/*
+		 * Poner mixers=0 quita esta fuente de las pistas del stream, pero no
+		 * la "mutea": los callbacks de captura de KZ siguen recibiendo su
+		 * audio crudo y pueden construir la mezcla retardada.
+		 */
+		obs_source_set_audio_mixers(source, 0);
+	}
+	release_audio_source_list(sources);
+
+	/* El motor horizontal será la única mezcla enviada durante el retardo. */
+	if (g_main_delay_source)
+		obs_source_set_audio_mixers(g_main_delay_source, 0x3F);
+
+	g_audio_direct_silenced = true;
+}
+
 obs_source_t *create_delay_source(const char *name, int mode, int seconds)
 {
 	obs_data_t *settings = obs_data_create();
@@ -134,7 +287,7 @@ obs_source_t *create_delay_source(const char *name, int mode, int seconds)
 	obs_data_set_double(settings, "delay_sec", (double)seconds);
 	obs_data_set_int(settings, "storage", STORAGE_DISK);
 	obs_data_set_int(settings, "audio_storage", 1);
-	obs_data_set_bool(settings, "audio_auto", false);
+	obs_data_set_bool(settings, "audio_auto", mode == MODE_DOCKS);
 
 	obs_source_t *src =
 		obs_source_create_private(DELAY_SOURCE_ID, name, settings);
@@ -216,6 +369,7 @@ void configure_main_source(int seconds)
 	obs_data_set_int(settings, "mode", MODE_DOCKS);
 	obs_data_set_double(settings, "delay_sec", (double)seconds);
 	obs_data_set_int(settings, "storage", STORAGE_DISK);
+	configure_automatic_audio_selection(settings);
 	obs_source_update(g_main_delay_source, settings);
 	obs_data_release(settings);
 }
@@ -362,8 +516,14 @@ void sync_live_targets()
 void go_live()
 {
 	g_recovering = false;
-	restore_live_outputs();
 	warp_set_state(WARP_LIVE);
+
+	/* Evita doble audio durante la transición de regreso. */
+	if (g_main_delay_source)
+		obs_source_set_audio_mixers(g_main_delay_source, 0);
+
+	restore_live_outputs();
+	restore_direct_audio();
 	g_delay_output_active = false;
 }
 
@@ -379,8 +539,13 @@ void go_delay()
 	set_delay_seconds(seconds);
 	warp_set_redirect_scene(false);
 	warp_set_dock_scene(g_live_main_scene.c_str());
+	configure_main_source(seconds);
 	configure_vertical_source(g_live_vertical_scene, seconds);
 	warp_set_state(WARP_DELAYED);
+
+	/* Conserva las fuentes vivas para capturarlas, pero quita su salida
+	 * directa de las pistas para que solo se escuche KZ retardado. */
+	silence_direct_audio();
 
 	g_delay_output_active = true;
 	g_recovering = false;
@@ -496,8 +661,8 @@ QWidget *build_dock()
 
 	auto *hint = new QLabel(QStringLiteral(
 		"No necesitas crear escenas ni fuentes de retardo. KZ Delay Dinámico "
-		"prepara sus motores internamente y mantiene sincronizados el canvas "
-		"horizontal y Aitum Vertical."));
+		"prepara sus motores internamente y mantiene sincronizados video y audio "
+		"entre el canvas horizontal y Aitum Vertical."));
 	hint->setWordWrap(true);
 	hint->setEnabled(false);
 	layout->addWidget(hint);
@@ -523,6 +688,7 @@ void release_internal_graph()
 {
 	if (g_delay_output_active)
 		restore_live_outputs();
+	restore_direct_audio();
 
 	if (g_main_output_scene) {
 		obs_scene_release(g_main_output_scene);
