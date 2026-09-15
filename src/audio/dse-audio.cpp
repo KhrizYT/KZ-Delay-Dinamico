@@ -47,6 +47,33 @@ static void program_mix_audio_cb(void *param, size_t mix_idx,
 	if (channels == 0 || rate == 0 || audio->frames == 0)
 		return;
 
+	/* V2.6: reloj de escritura contiguo.
+	 *
+	 * OBS entrega la mezcla final en bloques consecutivos. Para escribirlos
+	 * dentro del ring contamos muestras exactas (0, 1024, 2048...) en lugar
+	 * de volver a calcular la posicion usando timestamps redondeados.
+	 * El timestamp real de OBS se conserva para la SALIDA. */
+	thread_local DelayedSource *program_clock_source = nullptr;
+	thread_local uint64_t program_clock_base_ts = 0;
+	thread_local uint64_t program_clock_frames = 0;
+
+	if (program_clock_source != s || program_clock_base_ts == 0) {
+		program_clock_source = s;
+		program_clock_base_ts = audio->timestamp;
+		program_clock_frames = 0;
+	}
+
+	const uint64_t whole_sec =
+		program_clock_frames / (uint64_t)rate;
+	const uint64_t rem_frames =
+		program_clock_frames % (uint64_t)rate;
+	const uint64_t ring_offset_ns =
+		whole_sec * 1000000000ULL +
+		(rem_frames * 1000000000ULL + (uint64_t)rate - 1ULL) /
+			(uint64_t)rate;
+	const uint64_t ring_ts =
+		program_clock_base_ts + ring_offset_ns;
+	program_clock_frames += audio->frames;
 	const uint8_t *planes[MAX_AV_PLANES] = {};
 	for (size_t ch = 0; ch < channels && ch < MAX_AV_PLANES; ch++)
 		planes[ch] = audio->data[ch];
@@ -61,7 +88,7 @@ static void program_mix_audio_cb(void *param, size_t mix_idx,
 
 	uint64_t out_ts = 0;
 	const size_t emitted = s->mixer.process(
-		planes, audio->frames, audio->timestamp, 1.0f, false,
+		planes, audio->frames, ring_ts, 1.0f, false,
 		s->audio_speed.load(std::memory_order_relaxed),
 		s->audio_snap_ns.load(std::memory_order_relaxed), true,
 		s->audio_out, out_ts);
@@ -77,7 +104,7 @@ static void program_mix_audio_cb(void *param, size_t mix_idx,
 	out.speakers = oai.speakers;
 	out.format = AUDIO_FORMAT_FLOAT_PLANAR;
 	out.samples_per_sec = (uint32_t)rate;
-	out.timestamp = out_ts;
+	out.timestamp = audio->timestamp; /* reloj real de OBS */
 
 	obs_source_output_audio(s->self, &out);
 
