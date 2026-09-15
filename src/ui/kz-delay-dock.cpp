@@ -21,6 +21,9 @@
 #include <QLabel>
 #include <QPointer>
 #include <QPushButton>
+#include <QSettings>
+#include <QFileInfo>
+#include <QDir>
 #include <QSpinBox>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -70,6 +73,48 @@ bool g_audio_direct_silenced = false;
 
 size_t g_program_mix_idx = 0; /* Track 1 en directo */
 size_t g_delay_bus_mix_idx = 5; /* preferimos Track 6 como bus oculto */
+int load_saved_delay_seconds()
+{
+	char *path = obs_module_config_path("kz-delay-dinamico.ini");
+	if (!path)
+		return 30;
+
+	const QString qpath = QString::fromUtf8(path);
+	bfree(path);
+
+	QFileInfo info(qpath);
+	QDir().mkpath(info.absolutePath());
+
+	QSettings settings(qpath, QSettings::IniFormat);
+	int value = settings.value(QStringLiteral("KZDelay/seconds"), 30).toInt();
+	if (value < 5)
+		value = 5;
+	if (value > 300)
+		value = 300;
+	return value;
+}
+
+void save_delay_seconds(int seconds)
+{
+	if (seconds < 5)
+		seconds = 5;
+	if (seconds > 300)
+		seconds = 300;
+
+	char *path = obs_module_config_path("kz-delay-dinamico.ini");
+	if (!path)
+		return;
+
+	const QString qpath = QString::fromUtf8(path);
+	bfree(path);
+
+	QFileInfo info(qpath);
+	QDir().mkpath(info.absolutePath());
+
+	QSettings settings(qpath, QSettings::IniFormat);
+	settings.setValue(QStringLiteral("KZDelay/seconds"), seconds);
+	settings.sync();
+}
 int current_delay_seconds()
 {
 	return g_delay_spin ? g_delay_spin->value() : 30;
@@ -791,7 +836,7 @@ QWidget *build_dock()
 	delay_row->addWidget(new QLabel(QStringLiteral("Retardo")));
 	g_delay_spin = new QSpinBox();
 	g_delay_spin->setRange(5, 300);
-	g_delay_spin->setValue(30);
+	g_delay_spin->setValue(load_saved_delay_seconds());
 	g_delay_spin->setSuffix(QStringLiteral(" s"));
 	delay_row->addWidget(g_delay_spin, 1);
 	layout->addLayout(delay_row);
@@ -831,6 +876,7 @@ QWidget *build_dock()
 	QObject::connect(g_delay_spin,
 			 QOverload<int>::of(&QSpinBox::valueChanged),
 			 [](int value) {
+				 save_delay_seconds(value);
 				 if (!g_delay_output_active)
 					 set_delay_seconds(value);
 			 });
