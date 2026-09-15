@@ -35,6 +35,8 @@ namespace {
 
 constexpr const char *DELAY_SOURCE_ID = "kz_delay_dinamico";
 constexpr const char *DOCK_ID = "KZDelayDinamicoDock";
+constexpr const char *ROUTE_PENDING_KEY = "kz_delay_dinamico_route_pending";
+constexpr const char *ROUTE_MIXERS_KEY = "kz_delay_dinamico_original_mixers";
 
 QPointer<QWidget> g_dock;
 QPointer<QLabel> g_state_label;
@@ -209,6 +211,68 @@ void release_audio_source_list(std::vector<obs_source_t *> &sources)
 	sources.clear();
 }
 
+void persist_audio_route(obs_source_t *source, uint32_t mixers)
+{
+	if (!source)
+		return;
+
+	obs_data_t *priv = obs_source_get_private_settings(source);
+	if (!priv)
+		return;
+
+	obs_data_set_int(priv, ROUTE_MIXERS_KEY, (long long)mixers);
+	obs_data_set_bool(priv, ROUTE_PENDING_KEY, true);
+	obs_data_release(priv);
+}
+
+void clear_persisted_audio_route(obs_source_t *source)
+{
+	if (!source)
+		return;
+
+	obs_data_t *priv = obs_source_get_private_settings(source);
+	if (!priv)
+		return;
+
+	obs_data_set_bool(priv, ROUTE_PENDING_KEY, false);
+	obs_data_release(priv);
+}
+
+void restore_orphaned_audio_routes()
+{
+	if (g_delay_output_active)
+		return;
+
+	auto sources = collect_obs_audio_sources();
+	int restored = 0;
+
+	for (obs_source_t *source : sources) {
+		if (!source || is_kz_delay_source(source))
+			continue;
+
+		obs_data_t *priv = obs_source_get_private_settings(source);
+		if (!priv)
+			continue;
+
+		if (obs_data_get_bool(priv, ROUTE_PENDING_KEY)) {
+			const uint32_t mixers =
+				(uint32_t)obs_data_get_int(priv, ROUTE_MIXERS_KEY);
+			obs_source_set_audio_mixers(source, mixers);
+			obs_data_set_bool(priv, ROUTE_PENDING_KEY, false);
+			restored++;
+		}
+
+		obs_data_release(priv);
+	}
+
+	release_audio_source_list(sources);
+
+	if (restored > 0) {
+		blog(LOG_INFO,
+		     "[kz-delay-dinamico] restauradas %d ruta(s) de audio pendientes",
+		     restored);
+	}
+}
 void configure_automatic_audio_selection(obs_data_t *settings)
 {
 	if (!settings)
@@ -292,12 +356,16 @@ void restore_direct_audio()
 	for (SavedAudioRoute &route : g_saved_audio_routes) {
 		if (route.source) {
 			obs_source_set_audio_mixers(route.source, route.mixers);
+			clear_persisted_audio_route(route.source);
 			obs_source_release(route.source);
 			route.source = nullptr;
 		}
 	}
 	g_saved_audio_routes.clear();
-	g_audio_direct_silenced = false;
+	 g_audio_direct_silenced = false;
+
+	/* Recupera rutas si OBS/plugin perdio la lista en memoria. */
+	restore_orphaned_audio_routes();
 
 	/* Ya sin KZ en Track 1, volvemos a capturar exactamente la mezcla
 	 * nativa de Track 1 y seguimos llenando el ring para el prÃ³ximo salto. */
@@ -319,6 +387,9 @@ void silence_direct_audio()
 		const uint32_t mixers = obs_source_get_audio_mixers(source);
 		if ((mixers & program_bit) == 0)
 			continue;
+
+				/* Guardar antes de modificar: sobrevive a cierres inesperados. */
+		persist_audio_route(source, mixers);
 
 		SavedAudioRoute route;
 		route.source = obs_source_get_ref(source);
@@ -565,6 +636,9 @@ void sync_live_targets()
 {
 	if (g_delay_output_active)
 		return;
+
+	/* V2.7: autorreparacion de rutas pendientes. */
+	restore_orphaned_audio_routes();
 
 	const std::string main = current_main_scene();
 	if (!main.empty())
