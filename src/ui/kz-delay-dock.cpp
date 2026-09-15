@@ -8,6 +8,7 @@
  */
 #include "kz-delay-dock.hpp"
 
+#include "../audio/dse-audio.hpp"
 #include "../core/dse-internal.hpp"
 #include "../warp/warp-control.hpp"
 
@@ -65,6 +66,8 @@ struct SavedAudioRoute {
 std::vector<SavedAudioRoute> g_saved_audio_routes;
 bool g_audio_direct_silenced = false;
 
+size_t g_program_mix_idx = 0; /* Track 1 en directo */
+size_t g_delay_bus_mix_idx = 5; /* preferimos Track 6 como bus oculto */
 int current_delay_seconds()
 {
 	return g_delay_spin ? g_delay_spin->value() : 30;
@@ -240,10 +243,51 @@ void configure_automatic_audio_selection(obs_data_t *settings)
 	release_audio_source_list(sources);
 }
 
+DelayedSource *main_engine_instance()
+{
+	std::lock_guard<std::mutex> lock(g_reg_mutex);
+	for (DelayedSource *s : g_registry) {
+		if (s && s->self == g_main_delay_source)
+			return s;
+	}
+	return nullptr;
+}
+
+void set_program_mix_input(size_t mix_idx)
+{
+	DelayedSource *s = main_engine_instance();
+	if (!s)
+		return;
+	set_program_mix_track(s, mix_idx);
+	g_program_mix_idx = mix_idx;
+}
+
+/* Busca una pista libre para el bus interno. Evitamos Track 1 porque es el
+ * programa que usan normalmente stream/recording. */
+size_t choose_delay_bus_mix()
+{
+	uint32_t used = 0;
+	auto sources = collect_obs_audio_sources();
+	for (obs_source_t *source : sources) {
+		if (!is_kz_delay_source(source))
+			used |= obs_source_get_audio_mixers(source) & 0x3F;
+	}
+	release_audio_source_list(sources);
+
+	for (int i = 5; i >= 1; --i) {
+		if ((used & (1u << i)) == 0)
+			return (size_t)i;
+	}
+
+	blog(LOG_WARNING,
+	     "[kz-delay-dinamico] no hay pista libre; usando Track 6 como bus");
+	return 5;
+}
 void restore_direct_audio()
 {
-	if (!g_audio_direct_silenced && g_saved_audio_routes.empty())
-		return;
+	/* Primero apaga la salida retardada para que Track 1 quede limpio. */
+	if (g_main_delay_source)
+		obs_source_set_audio_mixers(g_main_delay_source, 0);
 
 	for (SavedAudioRoute &route : g_saved_audio_routes) {
 		if (route.source) {
@@ -254,29 +298,27 @@ void restore_direct_audio()
 	}
 	g_saved_audio_routes.clear();
 	g_audio_direct_silenced = false;
-}
 
+	/* Ya sin KZ en Track 1, volvemos a capturar exactamente la mezcla
+	 * nativa de Track 1 y seguimos llenando el ring para el prÃ³ximo salto. */
+	set_program_mix_input(0);
+}
 void silence_direct_audio()
 {
 	restore_direct_audio();
 
-	auto sources = collect_obs_audio_sources();
-	uint32_t kz_mixers = 0;
+	const uint32_t program_bit = 0x01; /* Track 1 */
+	g_delay_bus_mix_idx = choose_delay_bus_mix();
+	const uint32_t bus_bit = 1u << g_delay_bus_mix_idx;
 
+	auto sources = collect_obs_audio_sources();
 	for (obs_source_t *source : sources) {
-		/* El propio motor KZ tiene que seguir saliendo. El Broadcast Delay
-		 * antiguo sí se silencia temporalmente para que no duplique audio. */
 		if (is_kz_delay_source(source))
 			continue;
 
 		const uint32_t mixers = obs_source_get_audio_mixers(source);
-		if (mixers == 0)
+		if ((mixers & program_bit) == 0)
 			continue;
-
-		/* Recuerda qué pistas estaban realmente en uso. No mandaremos KZ a
-		 * pistas que antes no contenían ninguna de estas fuentes. */
-		if (!is_legacy_delay_source(source))
-			kz_mixers |= mixers;
 
 		SavedAudioRoute route;
 		route.source = obs_source_get_ref(source);
@@ -284,24 +326,33 @@ void silence_direct_audio()
 		if (route.source)
 			g_saved_audio_routes.push_back(route);
 
-		/*
-		 * Poner mixers=0 quita esta fuente de las pistas del stream, pero no
-		 * la "mutea": los callbacks de captura de KZ siguen recibiendo su
-		 * audio crudo y pueden construir la mezcla retardada.
-		 */
-		obs_source_set_audio_mixers(source, 0);
+		if (is_legacy_delay_source(source)) {
+			/* El Broadcast Delay antiguo no entra al bus y tampoco sale
+			 * directo por Track 1 durante la prueba. */
+			obs_source_set_audio_mixers(source, mixers & ~program_bit);
+		} else {
+			/* Conserva cualquier otra pista que ya tuviera la fuente,
+			 * quita solo Track 1 y aÃ±ade el bus interno. */
+			obs_source_set_audio_mixers(
+				source, (mixers & ~program_bit) | bus_bit);
+		}
 	}
 	release_audio_source_list(sources);
 
-	/* Enviar la mezcla KZ solo a las pistas que realmente usaba el audio
-	 * original. Track 1 como fallback únicamente si no encontramos ninguna. */
+	/* El bus contiene la MISMA mezcla nativa que antes salÃ­a por Track 1.
+	 * Cambiamos el punto de captura sin resetear el ring. */
+	set_program_mix_input(g_delay_bus_mix_idx);
+
+	/* Ahora sÃ­: KZ es lo Ãºnico que sale por Track 1. */
 	if (g_main_delay_source)
-		obs_source_set_audio_mixers(g_main_delay_source,
-					    kz_mixers ? kz_mixers : 0x01);
+		obs_source_set_audio_mixers(g_main_delay_source, program_bit);
 
 	g_audio_direct_silenced = true;
-}
 
+	blog(LOG_INFO,
+	     "[kz-delay-dinamico] retardo audio: Track 1 -> bus Track %zu -> KZ",
+	     g_delay_bus_mix_idx + 1);
+}
 obs_source_t *create_delay_source(const char *name, int mode, int seconds)
 {
 	obs_data_t *settings = obs_data_create();
@@ -531,6 +582,12 @@ void sync_live_targets()
 		warp_set_dock_scene(g_live_main_scene.c_str());
 
 	configure_main_source(current_delay_seconds());
+
+	/* V2.5: precarga continua con la mezcla final de Track 1. */
+	set_program_mix_input(0);
+	if (g_main_delay_source)
+		obs_source_set_audio_mixers(g_main_delay_source, 0);
+
 	if (!g_live_vertical_scene.empty())
 		configure_vertical_source(g_live_vertical_scene,
 					  current_delay_seconds());

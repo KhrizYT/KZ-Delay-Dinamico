@@ -27,6 +27,62 @@ static void dispatch_live_mix(DelayedSource *s, size_t channels, size_t rate)
 			       (uint32_t)rate, lts);
 }
 
+/* V2.5: recibe directamente una mezcla completa de OBS (una pista).
+ * AquÃ­ ya vienen aplicados filtros, volumen, balance y la mezcla nativa.
+ * Al no volver a sumar fuentes individualmente evitamos el audio Ã¡spero /
+ * saturado que podÃ­a producir la ruta experimental anterior. */
+static void program_mix_audio_cb(void *param, size_t mix_idx,
+                                 struct audio_data *audio)
+{
+	auto *s = static_cast<DelayedSource *>(param);
+	if (!s || !audio || !s->enabled.load(std::memory_order_relaxed))
+		return;
+
+	struct obs_audio_info oai;
+	if (!obs_get_audio_info(&oai))
+		return;
+
+	const size_t channels = get_audio_channels(oai.speakers);
+	const size_t rate = oai.samples_per_sec;
+	if (channels == 0 || rate == 0 || audio->frames == 0)
+		return;
+
+	const uint8_t *planes[MAX_AV_PLANES] = {};
+	for (size_t ch = 0; ch < channels && ch < MAX_AV_PLANES; ch++)
+		planes[ch] = audio->data[ch];
+
+	std::lock_guard<std::mutex> lock(s->audio_mutex);
+	s->mixer.configure(channels, rate);
+	s->mixer.set_target_delay(
+		s->delay_ns.load(std::memory_order_relaxed));
+
+	if (s->audio_out.size() < channels)
+		s->audio_out.resize(channels);
+
+	uint64_t out_ts = 0;
+	const size_t emitted = s->mixer.process(
+		planes, audio->frames, audio->timestamp, 1.0f, false,
+		s->audio_speed.load(std::memory_order_relaxed),
+		s->audio_snap_ns.load(std::memory_order_relaxed), true,
+		s->audio_out, out_ts);
+
+	if (emitted == 0)
+		return;
+
+	struct obs_source_audio out = {};
+	for (size_t ch = 0; ch < channels; ch++)
+		out.data[ch] = reinterpret_cast<const uint8_t *>(
+			s->audio_out[ch].data());
+	out.frames = (uint32_t)emitted;
+	out.speakers = oai.speakers;
+	out.format = AUDIO_FORMAT_FLOAT_PLANAR;
+	out.samples_per_sec = (uint32_t)rate;
+	out.timestamp = out_ts;
+
+	obs_source_output_audio(s->self, &out);
+
+	UNUSED_PARAMETER(mix_idx);
+}
 /* Every captured audio source feeds this one callback, which mixes them and
  * emits the delayed result. Runs on the OBS audio thread(s). */
 static void audio_capture_cb(void *param, obs_source_t *source,
@@ -396,6 +452,11 @@ static void collect_global_audio(std::vector<obs_source_t *> *list)
 /* Drop the current audio capture set. Caller holds target_mutex. */
 void detach_audio_locked(DelayedSource *s)
 {
+	if (s->program_mix_attached) {
+		obs_remove_raw_audio_callback(s->program_mix_idx,
+					      program_mix_audio_cb, s);
+		s->program_mix_attached = false;
+	}
 	for (obs_source_t *src : s->audio_sources) {
 		obs_source_remove_audio_capture_callback(src, audio_capture_cb, s);
 		obs_source_release(src);
@@ -412,6 +473,16 @@ void gather_audio_locked(DelayedSource *s)
 {
 	detach_audio_locked(s);
 
+	/* V2.5 program mix path: OBS ya hizo toda la mezcla. No adjuntamos
+	 * callbacks fuente-por-fuente y, muy importante, no reseteamos el ring
+	 * al cambiar de escena/pista. */
+	if (s->program_mix_audio) {
+		obs_add_raw_audio_callback(s->program_mix_idx, nullptr,
+					   program_mix_audio_cb, s);
+		s->program_mix_attached = true;
+		s->audio_clock.store(nullptr, std::memory_order_relaxed);
+		return;
+	}
 	if (!s->audio_auto) {
 		/* WASAPI mode: attach global audio as clock to drive the
 		 * callback.  OBS audio is replaced by WASAPI data when
@@ -450,4 +521,36 @@ void gather_audio_locked(DelayedSource *s)
 		std::lock_guard<std::mutex> alock(s->audio_mutex);
 		s->mixer.reset();
 	}
+}
+/* Cambia la pista nativa que alimenta el ring sin borrar lo ya almacenado.
+ * En directo capturamos Track 1. Al activar retardo movemos las fuentes a
+ * un bus libre (normalmente Track 6) y capturamos ese bus; KZ puede entonces
+ * salir por Track 1 sin realimentarse a sÃ­ mismo. */
+void set_program_mix_track(DelayedSource *s, size_t mix_idx)
+{
+	if (!s || mix_idx >= MAX_AUDIO_MIXES)
+		return;
+
+	std::lock_guard<std::mutex> lock(s->target_mutex);
+	if (s->program_mix_audio && s->program_mix_attached &&
+	    s->program_mix_idx == mix_idx)
+		return;
+
+	const bool first_enable = !s->program_mix_audio;
+	detach_audio_locked(s);
+
+	s->program_mix_audio = true;
+	s->program_mix_idx = mix_idx;
+	obs_add_raw_audio_callback(mix_idx, nullptr, program_mix_audio_cb, s);
+	s->program_mix_attached = true;
+	s->audio_clock.store(nullptr, std::memory_order_relaxed);
+
+	if (first_enable) {
+		std::lock_guard<std::mutex> alock(s->audio_mutex);
+		s->mixer.reset();
+	}
+
+	blog(LOG_INFO,
+	     "[kz-delay-dinamico] audio nativo OBS: capturando Track %zu",
+	     mix_idx + 1);
 }
