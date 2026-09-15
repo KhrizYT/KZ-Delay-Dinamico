@@ -177,7 +177,8 @@ struct DelayedSource {
 	 * el audio fuente por fuente. Esto conserva filtros, faders y calidad nativa. */
 	bool program_mix_audio = false;
 	size_t program_mix_idx = 0;
-	bool program_mix_attached = false;#ifdef _WIN32
+	bool program_mix_attached = false;
+#ifdef _WIN32
 	/* WASAPI capture (direct Windows audio): one capture per non-muted
 	 * device. Acquisition is automatic; muting a device stops its capture.
 	 * All devices feed the same mix; ONE device emits the summed output (the
